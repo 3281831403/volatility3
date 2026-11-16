@@ -23,7 +23,7 @@ class IsfInfo(plugins.PluginInterface):
     """Determines information about the currently available ISF files, or a specific one"""
 
     _required_framework_version = (2, 0, 0)
-    _version = (2, 0, 0)
+    _version = (2, 1, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -153,15 +153,21 @@ class IsfInfo(plugins.PluginInterface):
                 constants.CACHE_PATH, constants.IDENTIFIERS_FILENAME
             )
             cache = symbol_cache.SqliteCache(identifiers_path)
-            valid = "Unknown"
-            for identifier, location in cache.get_identifier_dictionary().items():
-                (
-                    num_bases,
-                    num_types,
-                    num_enums,
-                    num_symbols,
-                ) = cache.get_location_statistics(location)
-                if identifier:
+            # Iterate every cached location (including duplicate identifiers
+            # and ISF files without an identifier) so that all discoverable
+            # ISF files are reported, not just the preferred one per identifier
+            for identifier, locations in cache.get_identifier_locations().items():
+                for location in locations:
+                    statistics = cache.get_location_statistics(location)
+                    if statistics is None:
+                        continue
+                    (
+                        num_bases,
+                        num_types,
+                        num_enums,
+                        num_symbols,
+                    ) = statistics
+                    valid = "Unknown"
                     json_hash = cache.get_hash(location)
                     if json_hash and json_hash in schemas.cached_validations:
                         valid = "True (cached)"
@@ -174,6 +180,10 @@ class IsfInfo(plugins.PluginInterface):
                             except (UnicodeDecodeError, json.decoder.JSONDecodeError):
                                 vollog.warning(f"Invalid ISF: {location}")
 
+                    if identifier is None:
+                        identifier_string = renderers.NotAvailableValue()
+                    else:
+                        identifier_string = str(identifier)
                     yield (
                         0,
                         (
@@ -183,7 +193,7 @@ class IsfInfo(plugins.PluginInterface):
                             num_types,
                             num_symbols,
                             num_enums,
-                            str(identifier),
+                            identifier_string,
                         ),
                     )
 

@@ -13,7 +13,7 @@ import urllib.request
 from abc import abstractmethod
 from typing import Dict, Generator, Iterable, List, Optional, Tuple
 
-from volatility3 import framework, schemas
+from volatility3 import framework, schemas, symbols
 from volatility3.framework import constants, interfaces
 from volatility3.framework.configuration import requirements
 from volatility3.framework.layers import resources
@@ -139,12 +139,36 @@ class CacheManagerInterface(interfaces.configuration.VersionableInterface):
     ) -> Dict[bytes, str]:
         """Returns a dictionary of identifiers and locations
 
+        Where several locations share an identifier, the location chosen is
+        deterministic: locations under earlier symbol directories (user
+        specified directories come first) win, remaining ties are broken by
+        ordering on the location URL itself.
+
         Args:
             operating_system: If set, limits responses to a specific operating system
             local_only: Returns only local locations
 
         Returns:
             A dictionary of identifiers mapped to a location
+        """
+
+    @abstractmethod
+    def get_identifier_locations(
+        self, operating_system: Optional[str] = None, local_only: bool = False
+    ) -> Dict[bytes, List[str]]:
+        """Returns a dictionary of identifiers and all their candidate locations
+
+        Each list of locations is sorted by preference (the location that
+        get_identifier_dictionary would choose comes first, shadowed
+        locations follow).  Files without an identifier are collected under
+        the None key.
+
+        Args:
+            operating_system: If set, limits responses to a specific operating system
+            local_only: Returns only local locations
+
+        Returns:
+            A dictionary of identifiers mapped to the list of matching locations
         """
 
     @abstractmethod
@@ -172,7 +196,7 @@ class CacheManagerInterface(interfaces.configuration.VersionableInterface):
 
 class SqliteCache(CacheManagerInterface):
     _required_framework_version = (2, 0, 0)
-    _version = (1, 0, 0)
+    _version = (1, 1, 0)
 
     def __init__(self, filename: str):
         super().__init__(filename)
@@ -218,11 +242,42 @@ class SqliteCache(CacheManagerInterface):
         database.commit()
         return database
 
+    @staticmethod
+    def _location_sort_key(location: str) -> Tuple[int, str]:
+        """Returns a deterministic sort key for a symbol location.
+
+        Locations are ordered by the position of the symbol directory that
+        contains them within symbols.__path__ (user specified symbol
+        directories are prepended to that list, so they take priority),
+        then local locations outside any known symbol directory, then remote
+        locations.  Remaining ties are broken on the location URL itself, so
+        the ordering is stable between runs and cache rebuilds.
+        """
+        pathname = None
+        parsed = urllib.parse.urlparse(location)
+        if parsed.scheme == "file":
+            pathname = urllib.request.url2pathname(parsed.path)
+        elif parsed.scheme == "jar":
+            inner_url = urllib.parse.urlparse(parsed.path)
+            if inner_url.scheme == "file":
+                pathname = inner_url.path.split("!")[0]
+        if pathname is not None:
+            pathname = os.path.normcase(os.path.realpath(pathname))
+            for index, base_path in enumerate(symbols.__path__):
+                base_path = os.path.normcase(os.path.realpath(base_path))
+                if pathname == base_path or pathname.startswith(
+                    base_path + os.path.sep
+                ):
+                    return (index, location)
+            return (len(symbols.__path__), location)
+        return (len(symbols.__path__) + 1, location)
+
     def find_location(
         self, identifier: bytes, operating_system: Optional[str]
     ) -> Optional[str]:
         """Returns the location of the symbol file given the identifier.
-        If multiple locations exist for an identifier, the last found is returned
+        If multiple locations exist for an identifier, the most preferred
+        one (as ordered by _location_sort_key) is returned
 
         Args:
             identifier: string that uniquely identifies a particular symbol table
@@ -237,10 +292,16 @@ class SqliteCache(CacheManagerInterface):
             statement = "SELECT location FROM cache WHERE identifier = ? AND operating_system = ?"
             parameters = (identifier, operating_system)
         results = self._database.cursor().execute(statement, parameters).fetchall()
-        result = None
-        for row in results:
-            result = row["location"]
-        return result
+        locations = sorted(
+            [row["location"] for row in results], key=self._location_sort_key
+        )
+        if not locations:
+            return None
+        if len(locations) > 1:
+            vollog.debug(
+                f"Duplicate entries for identifier {identifier}: using {locations[0]}, shadowed: {', '.join(locations[1:])}"
+            )
+        return locations[0]
 
     def get_local_locations(self) -> Generator[str, None, None]:
         result = (
@@ -370,7 +431,7 @@ class SqliteCache(CacheManagerInterface):
 
         # New or not recently updated
 
-        files_to_process = new_locations.union(cache_update)
+        files_to_process = sorted(new_locations.union(cache_update))
         number_files_to_process = len(files_to_process)
         cursor = self._database.cursor()
         try:
@@ -458,10 +519,24 @@ class SqliteCache(CacheManagerInterface):
             progress_callback(100, "Reading remote ISF list")
             self._database.commit()
 
-    def get_identifier_dictionary(
+    def get_identifier_locations(
         self, operating_system: Optional[str] = None, local_only: bool = False
-    ) -> Dict[bytes, str]:
-        output = {}
+    ) -> Dict[bytes, List[str]]:
+        """Returns a dictionary of identifiers and all their candidate locations
+
+        Each list of locations is sorted by preference (most preferred
+        first), so the first entry is the one get_identifier_dictionary
+        would choose.  Files without an identifier are collected under the
+        None key.
+
+        Args:
+            operating_system: If set, limits responses to a specific operating system
+            local_only: Returns only local locations
+
+        Returns:
+            A dictionary of identifiers mapped to the list of matching locations
+        """
+        output: Dict[bytes, List[str]] = {}
         additions = []
         statement = "SELECT location, identifier FROM cache"
         if local_only:
@@ -472,11 +547,27 @@ class SqliteCache(CacheManagerInterface):
             statement += f" WHERE {' AND '.join(additions)}"
         results = self._database.cursor().execute(statement)
         for row in results:
-            if row["identifier"] in output and row["identifier"] and row["location"]:
+            output.setdefault(row["identifier"], [])
+            if row["location"] and row["location"] not in output[row["identifier"]]:
+                output[row["identifier"]].append(row["location"])
+        for identifier in output:
+            output[identifier].sort(key=self._location_sort_key)
+        return output
+
+    def get_identifier_dictionary(
+        self, operating_system: Optional[str] = None, local_only: bool = False
+    ) -> Dict[bytes, str]:
+        output = {}
+        for identifier, locations in self.get_identifier_locations(
+            operating_system=operating_system, local_only=local_only
+        ).items():
+            if not locations:
+                continue
+            if len(locations) > 1:
                 vollog.debug(
-                    f"Duplicate entry for identifier {row['identifier']}: {row['location']} and {output[row['identifier']]}"
+                    f"Duplicate entries for identifier {identifier}: using {locations[0]}, shadowed: {', '.join(locations[1:])}"
                 )
-            output[row["identifier"]] = row["location"]
+            output[identifier] = locations[0]
         return output
 
     def get_identifiers(self, operating_system: Optional[str]) -> List[bytes]:

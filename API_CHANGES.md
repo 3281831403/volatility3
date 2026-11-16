@@ -4,6 +4,15 @@ API Changes
 When an addition to the existing API is made, the minor version is bumped.
 When an API feature or function is removed or changed, the major version is bumped.
 
+2.29.0
+======
+Symbol cache selection between duplicate identifiers is now deterministic
+(locations under earlier symbol directories win, ties break on the location URL).
+Added `get_identifier_locations` to the symbol cache manager, returning every
+candidate location per identifier in preference order.
+`isfinfo` now reports all cached ISF files, including duplicates and files
+without an identifier.
+
 2.25.0
 ======
 Pointer class now supports `get_raw_value()`.
